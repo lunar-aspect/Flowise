@@ -17,8 +17,6 @@ RUN npm install -g pnpm
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
-ENV FLOWISE_USERNAME=lunaraspect
-ENV FLOWISE_PASSWORD=lunaraspect1234
 
 WORKDIR /usr/src
 
