@@ -14,3 +14,4 @@ spec:
   selector:
     app: "flowise"
   type: "LoadBalancer"
+  loadBalancerIP: "34.168.31.91"
