@@ -4,6 +4,8 @@ metadata:
   name: flowise-ingress
   annotations:
     kubernetes.io/ingress.global-static-ip-name: flowise-ip
+    networking.gke.io/managed-certificates: flowise-cert
+    ingressClassName: "gce"
 spec:
   defaultBackend:
     service:
