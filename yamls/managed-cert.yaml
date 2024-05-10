@@ -1,7 +1,7 @@
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
 metadata:
-  name: flowise-cert
+  name: flowise-cert-dev
 spec:
   domains:
-    - flowise-prod.lunaraspect.com
+    - flowise-dev.lunaraspect.com
