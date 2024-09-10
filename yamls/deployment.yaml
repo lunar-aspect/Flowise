@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: flowise
-          image: gcr.io/lunaraspect-dev/flowise:dev-12
+          image: gcr.io/lunaraspect-dev/flowise:dev-13
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
