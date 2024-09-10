@@ -1,27 +1,27 @@
 import { Request } from 'express'
 import * as fs from 'fs'
 import { cloneDeep, omit } from 'lodash'
-import { ICommonObject, IMessage } from 'flowise-components'
+import { ICommonObject, IMessage, addArrayFilesToStorage, mapMimeTypeToInputField } from 'flowise-components'
 import telemetryService from '../services/telemetry'
 import logger from '../utils/logger'
 import {
     buildFlow,
     constructGraphs,
     getAllConnectedNodes,
-    mapMimeTypeToInputField,
     findMemoryNode,
     getMemorySessionId,
     getAppVersion,
     getTelemetryFlowObj,
     getStartingNodes
 } from '../utils'
-import { utilValidateKey } from './validateKey'
+import { validateChatflowAPIKey } from './validateKey'
 import { IncomingInput, INodeDirectedGraph, IReactFlowObject, chatType } from '../Interface'
 import { ChatFlow } from '../database/entities/ChatFlow'
 import { getRunningExpressApp } from '../utils/getRunningExpressApp'
 import { UpsertHistory } from '../database/entities/UpsertHistory'
 import { InternalFlowiseError } from '../errors/internalFlowiseError'
 import { StatusCodes } from 'http-status-codes'
+import { getErrorMessage } from '../errors/utils'
 
 /**
  * Upsert documents
@@ -42,31 +42,35 @@ export const upsertVector = async (req: Request, isInternal: boolean = false) =>
         }
 
         if (!isInternal) {
-            const isKeyValidated = await utilValidateKey(req, chatflow)
+            const isKeyValidated = await validateChatflowAPIKey(req, chatflow)
             if (!isKeyValidated) {
                 throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, `Unauthorized`)
             }
         }
 
-        const files = (req.files as any[]) || []
+        const files = (req.files as Express.Multer.File[]) || []
 
         if (files.length) {
             const overrideConfig: ICommonObject = { ...req.body }
+            const fileNames: string[] = []
             for (const file of files) {
-                const fileData = fs.readFileSync(file.path, { encoding: 'base64' })
-                const dataBase64String = `data:${file.mimetype};base64,${fileData},filename:${file.filename}`
+                const fileBuffer = fs.readFileSync(file.path)
+
+                const storagePath = await addArrayFilesToStorage(file.mimetype, fileBuffer, file.originalname, fileNames, chatflowid)
 
                 const fileInputField = mapMimeTypeToInputField(file.mimetype)
-                if (overrideConfig[fileInputField]) {
-                    overrideConfig[fileInputField] = JSON.stringify([...JSON.parse(overrideConfig[fileInputField]), dataBase64String])
-                } else {
-                    overrideConfig[fileInputField] = JSON.stringify([dataBase64String])
-                }
+
+                overrideConfig[fileInputField] = storagePath
+
+                fs.unlinkSync(file.path)
             }
             incomingInput = {
                 question: req.body.question ?? 'hello',
                 overrideConfig,
                 stopNodeId: req.body.stopNodeId
+            }
+            if (req.body.chatId) {
+                incomingInput.chatId = req.body.chatId
             }
         }
 
@@ -85,10 +89,15 @@ export const upsertVector = async (req: Request, isInternal: boolean = false) =>
         const memoryNode = findMemoryNode(nodes, edges)
         let sessionId = getMemorySessionId(memoryNode, incomingInput, chatId, isInternal)
 
-        const vsNodes = nodes.filter(
-            (node) =>
-                node.data.category === 'Vector Stores' && !node.data.label.includes('Upsert') && !node.data.label.includes('Load Existing')
-        )
+        const vsNodes = nodes.filter((node) => node.data.category === 'Vector Stores')
+
+        // Get StopNodeId for vector store which has fielUpload
+        const vsNodesWithFileUpload = vsNodes.filter((node) => node.data.inputs?.fileUpload)
+        if (vsNodesWithFileUpload.length > 1) {
+            throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, 'Multiple vector store nodes with fileUpload enabled')
+        } else if (vsNodesWithFileUpload.length === 1 && !stopNodeId) {
+            stopNodeId = vsNodesWithFileUpload[0].data.id
+        }
 
         // Check if multiple vector store nodes exist, and if stopNodeId is specified
         if (vsNodes.length > 1 && !stopNodeId) {
@@ -115,28 +124,28 @@ export const upsertVector = async (req: Request, isInternal: boolean = false) =>
 
         const { startingNodeIds, depthQueue } = getStartingNodes(filteredGraph, stopNodeId)
 
-        const upsertedResult = await buildFlow(
+        const upsertedResult = await buildFlow({
             startingNodeIds,
-            nodes,
-            edges,
-            filteredGraph,
+            reactFlowNodes: nodes,
+            reactFlowEdges: edges,
+            graph: filteredGraph,
             depthQueue,
-            appServer.nodesPool.componentNodes,
-            incomingInput.question,
+            componentNodes: appServer.nodesPool.componentNodes,
+            question: incomingInput.question,
             chatHistory,
             chatId,
-            sessionId ?? '',
+            sessionId: sessionId ?? '',
             chatflowid,
-            appServer.AppDataSource,
-            incomingInput?.overrideConfig,
-            appServer.cachePool,
+            appDataSource: appServer.AppDataSource,
+            overrideConfig: incomingInput?.overrideConfig,
+            cachePool: appServer.cachePool,
             isUpsert,
             stopNodeId
-        )
+        })
 
         const startingNodes = nodes.filter((nd) => startingNodeIds.includes(nd.data.id))
 
-        await appServer.chatflowPool.add(chatflowid, undefined, startingNodes, incomingInput?.overrideConfig)
+        await appServer.chatflowPool.add(chatflowid, undefined, startingNodes, incomingInput?.overrideConfig, chatId)
 
         // Save to DB
         if (upsertedResult['flowData'] && upsertedResult['result']) {
@@ -162,10 +171,12 @@ export const upsertVector = async (req: Request, isInternal: boolean = false) =>
         })
 
         return upsertedResult['result'] ?? { result: 'Successfully Upserted' }
-    } catch (error) {
-        logger.error('[server]: Error:', error)
-        if (error instanceof Error) {
-            throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, error.message)
+    } catch (e) {
+        logger.error('[server]: Error:', e)
+        if (e instanceof InternalFlowiseError && e.statusCode === StatusCodes.UNAUTHORIZED) {
+            throw e
+        } else {
+            throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, getErrorMessage(e))
         }
     }
 }

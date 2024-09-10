@@ -114,7 +114,11 @@ class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory
         this.chatflowid = fields.chatflowid
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         const id = overrideSessionId ? overrideSessionId : this.sessionId
         if (!id) return []
 
@@ -128,7 +132,11 @@ class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory
             }
         })
 
-        let baseMessages = mapChatMessageToBaseMessage(chatMessage)
+        if (prependMessages?.length) {
+            chatMessage.unshift(...prependMessages)
+        }
+
+        let baseMessages = await mapChatMessageToBaseMessage(chatMessage)
 
         // Prune baseMessages if it exceeds max token limit
         if (this.movingSummaryBuffer) {

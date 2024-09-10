@@ -136,6 +136,17 @@ class ConversationalAgent_Agents implements INode {
                 options.socketIO.to(options.socketIOClientId).emit('usedTools', res.usedTools)
                 usedTools = res.usedTools
             }
+            // If the tool is set to returnDirect, stream the output to the client
+            if (res.usedTools && res.usedTools.length) {
+                let inputTools = nodeData.inputs?.tools
+                inputTools = flatten(inputTools)
+                for (const tool of res.usedTools) {
+                    const inputTool = inputTools.find((inputTool: Tool) => inputTool.name === tool.tool)
+                    if (inputTool && inputTool.returnDirect) {
+                        options.socketIO.to(options.socketIOClientId).emit('token', tool.toolOutput)
+                    }
+                }
+            }
         } else {
             res = await executor.invoke({ input }, { callbacks: [loggerHandler, ...callbacks] })
             if (res.sourceDocuments) {
@@ -190,6 +201,7 @@ const prepareAgent = async (
     const systemMessage = nodeData.inputs?.systemMessage as string
     const memoryKey = memory.memoryKey ? memory.memoryKey : 'chat_history'
     const inputKey = memory.inputKey ? memory.inputKey : 'input'
+    const prependMessages = options?.prependMessages
 
     const outputParser = ChatConversationalAgent.getDefaultOutputParser({
         llm: model,
@@ -240,7 +252,7 @@ const prepareAgent = async (
             [inputKey]: (i: { input: string; steps: AgentStep[] }) => i.input,
             agent_scratchpad: async (i: { input: string; steps: AgentStep[] }) => await constructScratchPad(i.steps),
             [memoryKey]: async (_: { input: string; steps: AgentStep[] }) => {
-                const messages = (await memory.getChatMessages(flowObj?.sessionId, true)) as BaseMessage[]
+                const messages = (await memory.getChatMessages(flowObj?.sessionId, true, prependMessages)) as BaseMessage[]
                 return messages ?? []
             }
         },

@@ -104,7 +104,11 @@ class ConversationSummaryMemoryExtended extends FlowiseSummaryMemory implements 
         this.chatflowid = fields.chatflowid
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         const id = overrideSessionId ? overrideSessionId : this.sessionId
         if (!id) return []
 
@@ -119,7 +123,11 @@ class ConversationSummaryMemoryExtended extends FlowiseSummaryMemory implements 
             }
         })
 
-        const baseMessages = mapChatMessageToBaseMessage(chatMessage)
+        if (prependMessages?.length) {
+            chatMessage.unshift(...prependMessages)
+        }
+
+        const baseMessages = await mapChatMessageToBaseMessage(chatMessage)
 
         // Get summary
         if (this.llm && typeof this.llm !== 'string') {

@@ -1,3 +1,5 @@
+import * as PropTypes from 'prop-types'
+import moment from 'moment/moment'
 import { useEffect, useState } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { enqueueSnackbar as enqueueSnackbarAction, closeSnackbar as closeSnackbarAction } from '@/store/actions'
@@ -28,6 +30,8 @@ import MainCard from '@/ui-component/cards/MainCard'
 import { StyledButton } from '@/ui-component/button/StyledButton'
 import APIKeyDialog from './APIKeyDialog'
 import ConfirmDialog from '@/ui-component/dialog/ConfirmDialog'
+import ViewHeader from '@/layout/MainLayout/ViewHeader'
+import ErrorBoundary from '@/ErrorBoundary'
 
 // API
 import apiKeyApi from '@/api/apikey'
@@ -40,14 +44,23 @@ import useConfirm from '@/hooks/useConfirm'
 import useNotifier from '@/utils/useNotifier'
 
 // Icons
-import { IconTrash, IconEdit, IconCopy, IconChevronsUp, IconChevronsDown, IconX, IconPlus, IconEye, IconEyeOff } from '@tabler/icons'
+import {
+    IconTrash,
+    IconEdit,
+    IconCopy,
+    IconChevronsUp,
+    IconChevronsDown,
+    IconX,
+    IconPlus,
+    IconEye,
+    IconEyeOff,
+    IconFileUpload
+} from '@tabler/icons-react'
 import APIEmptySVG from '@/assets/images/api_empty.svg'
-import * as PropTypes from 'prop-types'
-import moment from 'moment/moment'
-import ViewHeader from '@/layout/MainLayout/ViewHeader'
-import ErrorBoundary from '@/ErrorBoundary'
+import UploadJSONFileDialog from '@/views/apikey/UploadJSONFileDialog'
 
 // ==============================|| APIKey ||============================== //
+
 const StyledTableCell = styled(TableCell)(({ theme }) => ({
     borderColor: theme.palette.grey[900] + 25,
     padding: '6px 16px',
@@ -199,6 +212,9 @@ const APIKey = () => {
     const [showApiKeys, setShowApiKeys] = useState([])
     const openPopOver = Boolean(anchorEl)
 
+    const [showUploadDialog, setShowUploadDialog] = useState(false)
+    const [uploadDialogProps, setUploadDialogProps] = useState({})
+
     const [search, setSearch] = useState('')
     const onSearchChange = (event) => {
         setSearch(event.target.value)
@@ -251,6 +267,17 @@ const APIKey = () => {
         }
         setDialogProps(dialogProp)
         setShowDialog(true)
+    }
+
+    const uploadDialog = () => {
+        const dialogProp = {
+            type: 'ADD',
+            cancelButtonName: 'Cancel',
+            confirmButtonName: 'Upload',
+            data: {}
+        }
+        setUploadDialogProps(dialogProp)
+        setShowUploadDialog(true)
     }
 
     const deleteKey = async (key) => {
@@ -307,6 +334,7 @@ const APIKey = () => {
 
     const onConfirm = () => {
         setShowDialog(false)
+        setShowUploadDialog(false)
         getAllAPIKeysApi.request()
     }
 
@@ -340,6 +368,15 @@ const APIKey = () => {
                 ) : (
                     <Stack flexDirection='column' sx={{ gap: 3 }}>
                         <ViewHeader onSearchChange={onSearchChange} search={true} searchPlaceholder='Search API Keys' title='API Keys'>
+                            <Button
+                                variant='outlined'
+                                sx={{ borderRadius: 2, height: '100%' }}
+                                onClick={uploadDialog}
+                                startIcon={<IconFileUpload />}
+                                id='btn_importApiKeys'
+                            >
+                                Import
+                            </Button>
                             <StyledButton
                                 variant='contained'
                                 sx={{ borderRadius: 2, height: '100%' }}
@@ -354,7 +391,7 @@ const APIKey = () => {
                             <Stack sx={{ alignItems: 'center', justifyContent: 'center' }} flexDirection='column'>
                                 <Box sx={{ p: 2, height: 'auto' }}>
                                     <img
-                                        style={{ objectFit: 'cover', height: '16vh', width: 'auto' }}
+                                        style={{ objectFit: 'cover', height: '20vh', width: 'auto' }}
                                         src={APIEmptySVG}
                                         alt='APIEmptySVG'
                                     />
@@ -467,6 +504,14 @@ const APIKey = () => {
                 onConfirm={onConfirm}
                 setError={setError}
             ></APIKeyDialog>
+            {showUploadDialog && (
+                <UploadJSONFileDialog
+                    show={showUploadDialog}
+                    dialogProps={uploadDialogProps}
+                    onCancel={() => setShowUploadDialog(false)}
+                    onConfirm={onConfirm}
+                ></UploadJSONFileDialog>
+            )}
             <ConfirmDialog />
         </>
     )

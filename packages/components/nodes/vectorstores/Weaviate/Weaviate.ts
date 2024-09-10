@@ -7,6 +7,7 @@ import { ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams, Indexi
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
 import { addMMRInputParams, resolveVectorStoreOrRetriever } from '../VectorStoreUtils'
 import { index } from '../../../src/indexing'
+import { VectorStore } from '@langchain/core/vectorstores'
 
 class Weaviate_VectorStores implements INode {
     label: string
@@ -32,7 +33,6 @@ class Weaviate_VectorStores implements INode {
         this.description =
             'Upsert embedded data and perform similarity or mmr search using Weaviate, a scalable open-source vector database'
         this.baseClasses = [this.type, 'VectorStoreRetriever', 'BaseRetriever']
-        this.badge = 'NEW'
         this.credential = {
             label: 'Connect Credential',
             name: 'credential',
@@ -114,6 +114,13 @@ class Weaviate_VectorStores implements INode {
                 type: 'number',
                 additionalParams: true,
                 optional: true
+            },
+            {
+                label: 'Weaviate Search Filter',
+                name: 'weaviateFilter',
+                type: 'json',
+                additionalParams: true,
+                optional: true
             }
         ]
         addMMRInputParams(this.inputs)
@@ -173,7 +180,7 @@ class Weaviate_VectorStores implements INode {
 
             try {
                 if (recordManager) {
-                    const vectorStore = await WeaviateStore.fromExistingIndex(embeddings, obj)
+                    const vectorStore = (await WeaviateStore.fromExistingIndex(embeddings, obj)) as unknown as VectorStore
                     await recordManager.createSchema()
                     const res = await index({
                         docsSource: finalDocs,
@@ -193,6 +200,53 @@ class Weaviate_VectorStores implements INode {
             } catch (e) {
                 throw new Error(e)
             }
+        },
+        async delete(nodeData: INodeData, ids: string[], options: ICommonObject): Promise<void> {
+            const weaviateScheme = nodeData.inputs?.weaviateScheme as string
+            const weaviateHost = nodeData.inputs?.weaviateHost as string
+            const weaviateIndex = nodeData.inputs?.weaviateIndex as string
+            const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
+            const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
+            const embeddings = nodeData.inputs?.embeddings as Embeddings
+            const recordManager = nodeData.inputs?.recordManager
+
+            const credentialData = await getCredentialData(nodeData.credential ?? '', options)
+            const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
+
+            const clientConfig: any = {
+                scheme: weaviateScheme,
+                host: weaviateHost
+            }
+            if (weaviateApiKey) clientConfig.apiKey = new ApiKey(weaviateApiKey)
+
+            const client: WeaviateClient = weaviate.client(clientConfig)
+
+            const obj: WeaviateLibArgs = {
+                //@ts-ignore
+                client,
+                indexName: weaviateIndex
+            }
+
+            if (weaviateTextKey) obj.textKey = weaviateTextKey
+            if (weaviateMetadataKeys) obj.metadataKeys = JSON.parse(weaviateMetadataKeys.replace(/\s/g, ''))
+
+            const weaviateStore = new WeaviateStore(embeddings, obj)
+
+            try {
+                if (recordManager) {
+                    const vectorStoreName = weaviateTextKey ? weaviateIndex + '_' + weaviateTextKey : weaviateIndex
+                    await recordManager.createSchema()
+                    ;(recordManager as any).namespace = (recordManager as any).namespace + '_' + vectorStoreName
+                    const keys: string[] = await recordManager.listKeys({})
+
+                    await weaviateStore.delete({ ids: keys })
+                    await recordManager.deleteKeys(keys)
+                } else {
+                    await weaviateStore.delete({ ids })
+                }
+            } catch (e) {
+                throw new Error(e)
+            }
         }
     }
 
@@ -203,6 +257,7 @@ class Weaviate_VectorStores implements INode {
         const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
         const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
         const embeddings = nodeData.inputs?.embeddings as Embeddings
+        let weaviateFilter = nodeData.inputs?.weaviateFilter
 
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
@@ -223,10 +278,13 @@ class Weaviate_VectorStores implements INode {
 
         if (weaviateTextKey) obj.textKey = weaviateTextKey
         if (weaviateMetadataKeys) obj.metadataKeys = JSON.parse(weaviateMetadataKeys.replace(/\s/g, ''))
+        if (weaviateFilter) {
+            weaviateFilter = typeof weaviateFilter === 'object' ? weaviateFilter : JSON.parse(weaviateFilter)
+        }
 
-        const vectorStore = await WeaviateStore.fromExistingIndex(embeddings, obj)
+        const vectorStore = (await WeaviateStore.fromExistingIndex(embeddings, obj)) as unknown as VectorStore
 
-        return resolveVectorStoreOrRetriever(nodeData, vectorStore)
+        return resolveVectorStoreOrRetriever(nodeData, vectorStore, weaviateFilter)
     }
 }
 

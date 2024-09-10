@@ -1,4 +1,5 @@
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { omit } from 'lodash'
+import { ICommonObject, IDocument, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { TextSplitter } from 'langchain/text_splitter'
 import { JSONLinesLoader } from 'langchain/document_loaders/fs/json'
 import { getFileFromStorage } from '../../../src'
@@ -44,9 +45,21 @@ class Jsonlines_DocumentLoaders implements INode {
                 optional: false
             },
             {
-                label: 'Metadata',
+                label: 'Additional Metadata',
                 name: 'metadata',
                 type: 'json',
+                description: 'Additional metadata to be added to the extracted documents',
+                optional: true,
+                additionalParams: true
+            },
+            {
+                label: 'Omit Metadata Keys',
+                name: 'omitMetadataKeys',
+                type: 'string',
+                rows: 4,
+                description:
+                    'Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field',
+                placeholder: 'key1, key2, key3.nestedKey1',
                 optional: true,
                 additionalParams: true
             }
@@ -58,8 +71,14 @@ class Jsonlines_DocumentLoaders implements INode {
         const jsonLinesFileBase64 = nodeData.inputs?.jsonlinesFile as string
         const pointerName = nodeData.inputs?.pointerName as string
         const metadata = nodeData.inputs?.metadata
+        const _omitMetadataKeys = nodeData.inputs?.omitMetadataKeys as string
 
-        let alldocs = []
+        let omitMetadataKeys: string[] = []
+        if (_omitMetadataKeys) {
+            omitMetadataKeys = _omitMetadataKeys.split(',').map((key) => key.trim())
+        }
+
+        let docs: IDocument[] = []
         let files: string[] = []
 
         let pointer = '/' + pointerName.trim()
@@ -74,16 +93,17 @@ class Jsonlines_DocumentLoaders implements INode {
             const chatflowid = options.chatflowid
 
             for (const file of files) {
+                if (!file) continue
                 const fileData = await getFileFromStorage(file, chatflowid)
                 const blob = new Blob([fileData])
                 const loader = new JSONLinesLoader(blob, pointer)
 
                 if (textSplitter) {
-                    const docs = await loader.loadAndSplit(textSplitter)
-                    alldocs.push(...docs)
+                    let splittedDocs = await loader.load()
+                    splittedDocs = await textSplitter.splitDocuments(splittedDocs)
+                    docs.push(...splittedDocs)
                 } else {
-                    const docs = await loader.load()
-                    alldocs.push(...docs)
+                    docs.push(...(await loader.load()))
                 }
             }
         } else {
@@ -94,6 +114,7 @@ class Jsonlines_DocumentLoaders implements INode {
             }
 
             for (const file of files) {
+                if (!file) continue
                 const splitDataURI = file.split(',')
                 splitDataURI.pop()
                 const bf = Buffer.from(splitDataURI.pop() || '', 'base64')
@@ -101,32 +122,48 @@ class Jsonlines_DocumentLoaders implements INode {
                 const loader = new JSONLinesLoader(blob, pointer)
 
                 if (textSplitter) {
-                    const docs = await loader.loadAndSplit(textSplitter)
-                    alldocs.push(...docs)
+                    let splittedDocs = await loader.load()
+                    splittedDocs = await textSplitter.splitDocuments(splittedDocs)
+                    docs.push(...splittedDocs)
                 } else {
-                    const docs = await loader.load()
-                    alldocs.push(...docs)
+                    docs.push(...(await loader.load()))
                 }
             }
         }
 
         if (metadata) {
             const parsedMetadata = typeof metadata === 'object' ? metadata : JSON.parse(metadata)
-            let finaldocs = []
-            for (const doc of alldocs) {
-                const newdoc = {
-                    ...doc,
-                    metadata: {
-                        ...doc.metadata,
-                        ...parsedMetadata
-                    }
-                }
-                finaldocs.push(newdoc)
-            }
-            return finaldocs
+            docs = docs.map((doc) => ({
+                ...doc,
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {
+                              ...parsedMetadata
+                          }
+                        : omit(
+                              {
+                                  ...doc.metadata,
+                                  ...parsedMetadata
+                              },
+                              omitMetadataKeys
+                          )
+            }))
+        } else {
+            docs = docs.map((doc) => ({
+                ...doc,
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {}
+                        : omit(
+                              {
+                                  ...doc.metadata
+                              },
+                              omitMetadataKeys
+                          )
+            }))
         }
 
-        return alldocs
+        return docs
     }
 }
 

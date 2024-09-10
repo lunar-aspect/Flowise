@@ -1,6 +1,7 @@
 import path from 'path'
 import fs from 'fs'
 import logger from './logger'
+import { Server } from 'socket.io'
 import {
     IComponentCredentials,
     IComponentNodes,
@@ -41,6 +42,8 @@ import { Assistant } from '../database/entities/Assistant'
 import { DataSource } from 'typeorm'
 import { CachePool } from '../CachePool'
 import { Variable } from '../database/entities/Variable'
+import { DocumentStore } from '../database/entities/DocumentStore'
+import { DocumentStoreFileChunk } from '../database/entities/DocumentStoreFileChunk'
 import { InternalFlowiseError } from '../errors/internalFlowiseError'
 import { StatusCodes } from 'http-status-codes'
 
@@ -54,7 +57,9 @@ export const databaseEntities: IDatabaseEntity = {
     Tool: Tool,
     Credential: Credential,
     Assistant: Assistant,
-    Variable: Variable
+    Variable: Variable,
+    DocumentStore: DocumentStore,
+    DocumentStoreFileChunk: DocumentStoreFileChunk
 }
 
 /**
@@ -263,9 +268,11 @@ export const getEndingNodes = (
                 endingNodeData &&
                 endingNodeData.category !== 'Chains' &&
                 endingNodeData.category !== 'Agents' &&
-                endingNodeData.category !== 'Engine'
+                endingNodeData.category !== 'Engine' &&
+                endingNodeData.category !== 'Multi Agents' &&
+                endingNodeData.category !== 'Sequential Agents'
             ) {
-                error = new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Ending node must be either a Chain or Agent`)
+                error = new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Ending node must be either a Chain or Agent or Engine`)
                 continue
             }
         }
@@ -371,38 +378,94 @@ export const saveUpsertFlowData = (nodeData: INodeData, upsertHistory: Record<st
 }
 
 /**
- * Build langchain from start to end
- * @param {string[]} startingNodeIds
+ * Check if doc loader should be bypassed, ONLY if doc loader is connected to a vector store
+ * Reason being we dont want to load the doc loader again whenever we are building the flow, because it was already done during upserting
+ * EXCEPT if the vector store is a memory vector store
+ * TODO: Remove this logic when we remove doc loader nodes from the canvas
+ * @param {IReactFlowNode} reactFlowNode
  * @param {IReactFlowNode[]} reactFlowNodes
- * @param {INodeDirectedGraph} graph
- * @param {IDepthQueue} depthQueue
- * @param {IComponentNodes} componentNodes
- * @param {string} question
- * @param {string} chatId
- * @param {string} chatflowid
- * @param {DataSource} appDataSource
- * @param {ICommonObject} overrideConfig
- * @param {CachePool} cachePool
+ * @param {IReactFlowEdge[]} reactFlowEdges
+ * @returns {boolean}
  */
-export const buildFlow = async (
-    startingNodeIds: string[],
+const checkIfDocLoaderShouldBeIgnored = (
+    reactFlowNode: IReactFlowNode,
     reactFlowNodes: IReactFlowNode[],
-    reactFlowEdges: IReactFlowEdge[],
-    graph: INodeDirectedGraph,
-    depthQueue: IDepthQueue,
-    componentNodes: IComponentNodes,
-    question: string,
-    chatHistory: IMessage[],
-    chatId: string,
-    sessionId: string,
-    chatflowid: string,
-    appDataSource: DataSource,
-    overrideConfig?: ICommonObject,
-    cachePool?: CachePool,
-    isUpsert?: boolean,
-    stopNodeId?: string,
+    reactFlowEdges: IReactFlowEdge[]
+): boolean => {
+    let outputId = ''
+
+    if (reactFlowNode.data.outputAnchors.length) {
+        if (Object.keys(reactFlowNode.data.outputs || {}).length) {
+            const output = reactFlowNode.data.outputs?.output
+            const node = reactFlowNode.data.outputAnchors[0].options?.find((anchor) => anchor.name === output)
+            if (node) outputId = (node as ICommonObject).id
+        } else {
+            outputId = (reactFlowNode.data.outputAnchors[0] as ICommonObject).id
+        }
+    }
+
+    const targetNodeId = reactFlowEdges.find((edge) => edge.sourceHandle === outputId)?.target
+
+    if (targetNodeId) {
+        const targetNodeCategory = reactFlowNodes.find((nd) => nd.id === targetNodeId)?.data.category || ''
+        const targetNodeName = reactFlowNodes.find((nd) => nd.id === targetNodeId)?.data.name || ''
+        if (targetNodeCategory === 'Vector Stores' && targetNodeName !== 'memoryVectorStore') {
+            return true
+        }
+    }
+
+    return false
+}
+
+type BuildFlowParams = {
+    startingNodeIds: string[]
+    reactFlowNodes: IReactFlowNode[]
+    reactFlowEdges: IReactFlowEdge[]
+    graph: INodeDirectedGraph
+    depthQueue: IDepthQueue
+    componentNodes: IComponentNodes
+    question: string
+    chatHistory: IMessage[]
+    chatId: string
+    sessionId: string
+    chatflowid: string
+    appDataSource: DataSource
+    overrideConfig?: ICommonObject
+    cachePool?: CachePool
+    isUpsert?: boolean
+    stopNodeId?: string
     uploads?: IFileUpload[]
-) => {
+    baseURL?: string
+    socketIO?: Server
+    socketIOClientId?: string
+}
+
+/**
+ * Build flow from start to end
+ * @param {BuildFlowParams} params
+ */
+export const buildFlow = async ({
+    startingNodeIds,
+    reactFlowNodes,
+    reactFlowEdges,
+    graph,
+    depthQueue,
+    componentNodes,
+    question,
+    chatHistory,
+    chatId,
+    sessionId,
+    chatflowid,
+    appDataSource,
+    overrideConfig,
+    cachePool,
+    isUpsert,
+    stopNodeId,
+    uploads,
+    baseURL,
+    socketIO,
+    socketIOClientId
+}: BuildFlowParams) => {
     const flowNodes = cloneDeep(reactFlowNodes)
 
     let upsertHistory: Record<string, any> = {}
@@ -423,6 +486,14 @@ export const buildFlow = async (
 
     const initializedNodes: Set<string> = new Set()
     const reversedGraph = constructGraphs(reactFlowNodes, reactFlowEdges, { isReversed: true }).graph
+
+    const flowData: ICommonObject = {
+        chatflowid,
+        chatId,
+        sessionId,
+        chatHistory,
+        ...overrideConfig
+    }
     while (nodeQueue.length) {
         const { nodeId, depth } = nodeQueue.shift() as INodeQueue
 
@@ -440,9 +511,15 @@ export const buildFlow = async (
 
             if (isUpsert) upsertHistory['flowData'] = saveUpsertFlowData(flowNodeData, upsertHistory)
 
-            const reactFlowNodeData: INodeData = resolveVariables(flowNodeData, flowNodes, question, chatHistory)
+            const reactFlowNodeData: INodeData = await resolveVariables(
+                appDataSource,
+                flowNodeData,
+                flowNodes,
+                question,
+                chatHistory,
+                flowData
+            )
 
-            // TODO: Avoid processing Text Splitter + Doc Loader once Upsert & Load Existing Vector Nodes are deprecated
             if (isUpsert && stopNodeId && nodeId === stopNodeId) {
                 logger.debug(`[server]: Upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 const indexResult = await newNodeInstance.vectorStoreMethods!['upsert']!.call(newNodeInstance, reactFlowNodeData, {
@@ -455,11 +532,20 @@ export const buildFlow = async (
                     databaseEntities,
                     cachePool,
                     dynamicVariables,
-                    uploads
+                    uploads,
+                    baseURL,
+                    socketIO,
+                    socketIOClientId
                 })
                 if (indexResult) upsertHistory['result'] = indexResult
                 logger.debug(`[server]: Finished upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 break
+            } else if (
+                !isUpsert &&
+                reactFlowNode.data.category === 'Document Loaders' &&
+                checkIfDocLoaderShouldBeIgnored(reactFlowNode, reactFlowNodes, reactFlowEdges)
+            ) {
+                initializedNodes.add(nodeId)
             } else {
                 logger.debug(`[server]: Initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 let outputResult = await newNodeInstance.init(reactFlowNodeData, question, {
@@ -471,8 +557,13 @@ export const buildFlow = async (
                     appDataSource,
                     databaseEntities,
                     cachePool,
+                    isUpsert,
                     dynamicVariables,
-                    uploads
+                    uploads,
+                    baseURL,
+                    socketIO,
+                    socketIOClientId,
+                    componentNodes: componentNodes as ICommonObject
                 })
 
                 // Save dynamic variables
@@ -490,9 +581,15 @@ export const buildFlow = async (
                 if (reactFlowNode.data.name === 'ifElseFunction' && typeof outputResult === 'object') {
                     let sourceHandle = ''
                     if (outputResult.type === true) {
-                        sourceHandle = `${nodeId}-output-returnFalse-string|number|boolean|json|array`
+                        // sourceHandle = `${nodeId}-output-returnFalse-string|number|boolean|json|array`
+                        sourceHandle = (
+                            reactFlowNode.data.outputAnchors.flatMap((n) => n.options).find((n) => n?.name === 'returnFalse') as any
+                        )?.id
                     } else if (outputResult.type === false) {
-                        sourceHandle = `${nodeId}-output-returnTrue-string|number|boolean|json|array`
+                        // sourceHandle = `${nodeId}-output-returnTrue-string|number|boolean|json|array`
+                        sourceHandle = (
+                            reactFlowNode.data.outputAnchors.flatMap((n) => n.options).find((n) => n?.name === 'returnTrue') as any
+                        )?.id
                     }
 
                     const ifElseEdge = reactFlowEdges.find((edg) => edg.source === nodeId && edg.sourceHandle === sourceHandle)
@@ -615,6 +712,53 @@ export const clearSessionMemory = async (
     }
 }
 
+const getGlobalVariable = async (appDataSource: DataSource, overrideConfig?: ICommonObject) => {
+    const variables = await appDataSource.getRepository(Variable).find()
+
+    // override variables defined in overrideConfig
+    // nodeData.inputs.vars is an Object, check each property and override the variable
+    if (overrideConfig?.vars) {
+        for (const propertyName of Object.getOwnPropertyNames(overrideConfig.vars)) {
+            const foundVar = variables.find((v) => v.name === propertyName)
+            if (foundVar) {
+                // even if the variable was defined as runtime, we override it with static value
+                foundVar.type = 'static'
+                foundVar.value = overrideConfig.vars[propertyName]
+            } else {
+                // add it the variables, if not found locally in the db
+                variables.push({
+                    name: propertyName,
+                    type: 'static',
+                    value: overrideConfig.vars[propertyName],
+                    id: '',
+                    updatedDate: new Date(),
+                    createdDate: new Date()
+                })
+            }
+        }
+    }
+
+    let vars = {}
+    if (variables.length) {
+        for (const item of variables) {
+            let value = item.value
+
+            // read from .env file
+            if (item.type === 'runtime') {
+                value = process.env[item.name] ?? ''
+            }
+
+            Object.defineProperty(vars, item.name, {
+                enumerable: true,
+                configurable: true,
+                writable: true,
+                value: value
+            })
+        }
+    }
+    return vars
+}
+
 /**
  * Get variable value from outputResponses.output
  * @param {string} paramValue
@@ -623,22 +767,25 @@ export const clearSessionMemory = async (
  * @param {boolean} isAcceptVariable
  * @returns {string}
  */
-export const getVariableValue = (
+export const getVariableValue = async (
+    appDataSource: DataSource,
     paramValue: string | object,
     reactFlowNodes: IReactFlowNode[],
     question: string,
     chatHistory: IMessage[],
-    isAcceptVariable = false
+    isAcceptVariable = false,
+    flowData?: ICommonObject
 ) => {
     const isObject = typeof paramValue === 'object'
-    let returnVal = (isObject ? JSON.stringify(paramValue) : paramValue) ?? ''
+    const initialValue = (isObject ? JSON.stringify(paramValue) : paramValue) ?? ''
+    let returnVal = initialValue
     const variableStack = []
     const variableDict = {} as IVariableDict
     let startIdx = 0
-    const endIdx = returnVal.length - 1
+    const endIdx = initialValue.length - 1
 
     while (startIdx < endIdx) {
-        const substr = returnVal.substring(startIdx, startIdx + 2)
+        const substr = initialValue.substring(startIdx, startIdx + 2)
 
         // Store the opening double curly bracket
         if (substr === '{{') {
@@ -649,7 +796,7 @@ export const getVariableValue = (
         if (substr === '}}' && variableStack.length > 0 && variableStack[variableStack.length - 1].substr === '{{') {
             const variableStartIdx = variableStack[variableStack.length - 1].startIdx
             const variableEndIdx = startIdx
-            const variableFullPath = returnVal.substring(variableStartIdx, variableEndIdx)
+            const variableFullPath = initialValue.substring(variableStartIdx, variableEndIdx)
 
             /**
              * Apply string transformation to convert special chars:
@@ -662,6 +809,23 @@ export const getVariableValue = (
 
             if (isAcceptVariable && variableFullPath === CHAT_HISTORY_VAR_PREFIX) {
                 variableDict[`{{${variableFullPath}}}`] = handleEscapeCharacters(convertChatHistoryToText(chatHistory), false)
+            }
+
+            if (variableFullPath.startsWith('$vars.')) {
+                const vars = await getGlobalVariable(appDataSource, flowData)
+                const variableValue = get(vars, variableFullPath.replace('$vars.', ''))
+                if (variableValue) {
+                    variableDict[`{{${variableFullPath}}}`] = variableValue
+                    returnVal = returnVal.split(`{{${variableFullPath}}}`).join(variableValue)
+                }
+            }
+
+            if (variableFullPath.startsWith('$flow.') && flowData) {
+                const variableValue = get(flowData, variableFullPath.replace('$flow.', ''))
+                if (variableValue) {
+                    variableDict[`{{${variableFullPath}}}`] = variableValue
+                    returnVal = returnVal.split(`{{${variableFullPath}}}`).join(variableValue)
+                }
             }
 
             // Resolve values with following case.
@@ -718,10 +882,22 @@ export const getVariableValue = (
         const variablePaths = Object.keys(variableDict)
         variablePaths.sort() // Sort by length of variable path because longer path could possibly contains nested variable
         variablePaths.forEach((path) => {
-            const variableValue = variableDict[path]
+            let variableValue: object | string = variableDict[path]
             // Replace all occurrence
             if (typeof variableValue === 'object') {
-                returnVal = returnVal.split(path).join(JSON.stringify(variableValue).replace(/"/g, '\\"'))
+                // Just get the id of variableValue object if it is agentflow node, to avoid circular JSON error
+                if (Object.prototype.hasOwnProperty.call(variableValue, 'predecessorAgents')) {
+                    const nodeId = variableValue['id']
+                    variableValue = { id: nodeId }
+                }
+
+                const stringifiedValue = JSON.stringify(JSON.stringify(variableValue))
+                if (stringifiedValue.startsWith('"') && stringifiedValue.endsWith('"')) {
+                    // get rid of the double quotes
+                    returnVal = returnVal.split(path).join(stringifiedValue.substring(1, stringifiedValue.length - 1))
+                } else {
+                    returnVal = returnVal.split(path).join(JSON.stringify(variableValue).replace(/"/g, '\\"'))
+                }
             } else {
                 returnVal = returnVal.split(path).join(variableValue)
             }
@@ -738,35 +914,53 @@ export const getVariableValue = (
  * @param {string} question
  * @returns {INodeData}
  */
-export const resolveVariables = (
+export const resolveVariables = async (
+    appDataSource: DataSource,
     reactFlowNodeData: INodeData,
     reactFlowNodes: IReactFlowNode[],
     question: string,
-    chatHistory: IMessage[]
-): INodeData => {
+    chatHistory: IMessage[],
+    flowData?: ICommonObject
+): Promise<INodeData> => {
     let flowNodeData = cloneDeep(reactFlowNodeData)
     const types = 'inputs'
 
-    const getParamValues = (paramsObj: ICommonObject) => {
+    const getParamValues = async (paramsObj: ICommonObject) => {
         for (const key in paramsObj) {
             const paramValue: string = paramsObj[key]
             if (Array.isArray(paramValue)) {
                 const resolvedInstances = []
                 for (const param of paramValue) {
-                    const resolvedInstance = getVariableValue(param, reactFlowNodes, question, chatHistory)
+                    const resolvedInstance = await getVariableValue(
+                        appDataSource,
+                        param,
+                        reactFlowNodes,
+                        question,
+                        chatHistory,
+                        undefined,
+                        flowData
+                    )
                     resolvedInstances.push(resolvedInstance)
                 }
                 paramsObj[key] = resolvedInstances
             } else {
                 const isAcceptVariable = reactFlowNodeData.inputParams.find((param) => param.name === key)?.acceptVariable ?? false
-                const resolvedInstance = getVariableValue(paramValue, reactFlowNodes, question, chatHistory, isAcceptVariable)
+                const resolvedInstance = await getVariableValue(
+                    appDataSource,
+                    paramValue,
+                    reactFlowNodes,
+                    question,
+                    chatHistory,
+                    isAcceptVariable,
+                    flowData
+                )
                 paramsObj[key] = resolvedInstance
             }
         }
     }
 
     const paramsObj = flowNodeData[types] ?? {}
-    getParamValues(paramsObj)
+    await getParamValues(paramsObj)
 
     return flowNodeData
 }
@@ -903,35 +1097,16 @@ export const isSameOverrideConfig = (
 }
 
 /**
- * Map MimeType to InputField
- * @param {string} mimeType
- * @returns {Promise<string>}
+ * @param {string} existingChatId
+ * @param {string} newChatId
+ * @returns {boolean}
  */
-export const mapMimeTypeToInputField = (mimeType: string) => {
-    switch (mimeType) {
-        case 'text/plain':
-            return 'txtFile'
-        case 'application/pdf':
-            return 'pdfFile'
-        case 'application/json':
-            return 'jsonFile'
-        case 'text/csv':
-            return 'csvFile'
-        case 'application/json-lines':
-        case 'application/jsonl':
-        case 'text/jsonl':
-            return 'jsonlinesFile'
-        case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-            return 'docxFile'
-        case 'application/vnd.yaml':
-        case 'application/x-yaml':
-        case 'text/vnd.yaml':
-        case 'text/x-yaml':
-        case 'text/yaml':
-            return 'yamlFile'
-        default:
-            return ''
+export const isSameChatId = (existingChatId?: string, newChatId?: string): boolean => {
+    if (isEqual(existingChatId, newChatId)) {
+        return true
     }
+    if (!existingChatId && !newChatId) return true
+    return false
 }
 
 /**
@@ -1000,7 +1175,6 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
             }
         }
     }
-
     return configs
 }
 
@@ -1020,11 +1194,18 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
             'chatAnthropic',
             'chatAnthropic_LlamaIndex',
             'chatOllama',
+            'chatOllama_LlamaIndex',
             'awsChatBedrock',
             'chatMistralAI',
+            'chatMistral_LlamaIndex',
             'groqChat',
+            'chatGroq_LlamaIndex',
             'chatCohere',
-            'chatGoogleGenerativeAI'
+            'chatGoogleGenerativeAI',
+            'chatTogetherAI',
+            'chatTogetherAI_LlamaIndex',
+            'chatFireworks',
+            'chatBaiduWenxin'
         ],
         LLMs: ['azureOpenAI', 'openAI', 'ollama']
     }
@@ -1053,14 +1234,16 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
             'airtableAgent',
             'conversationalRetrievalAgent',
             'openAIToolAgent',
-            'toolAgent'
+            'toolAgent',
+            'conversationalRetrievalToolAgent',
+            'openAIToolAgentLlamaIndex'
         ]
         isValidChainOrAgent = whitelistAgents.includes(endingNodeData.name)
 
-        // Anthropic & Groq Function Calling streaming is still not supported - https://docs.anthropic.com/claude/docs/tool-use
+        // Anthropic streaming has some bug where the log is being sent, temporarily disabled
         const model = endingNodeData.inputs?.model
         if (endingNodeData.name.includes('toolAgent')) {
-            if (typeof model === 'string' && (model.includes('chatAnthropic') || model.includes('groqChat'))) {
+            if (typeof model === 'string' && model.includes('chatAnthropic')) {
                 return false
             } else if (typeof model === 'object' && 'id' in model && model['id'].includes('chatAnthropic')) {
                 return false
@@ -1257,7 +1440,8 @@ export const getSessionChatHistory = async (
     componentNodes: IComponentNodes,
     appDataSource: DataSource,
     databaseEntities: IDatabaseEntity,
-    logger: any
+    logger: any,
+    prependMessages?: IMessage[]
 ): Promise<IMessage[]> => {
     const nodeInstanceFilePath = componentNodes[memoryNode.data.name].filePath as string
     const nodeModule = await import(nodeInstanceFilePath)
@@ -1275,7 +1459,7 @@ export const getSessionChatHistory = async (
         logger
     })
 
-    return (await initializedInstance.getChatMessages(sessionId)) as IMessage[]
+    return (await initializedInstance.getChatMessages(sessionId, undefined, prependMessages)) as IMessage[]
 }
 
 /**
@@ -1382,4 +1566,11 @@ export const getAppVersion = async () => {
     } catch (error) {
         return ''
     }
+}
+
+export const convertToValidFilename = (word: string) => {
+    return word
+        .replace(/[/|\\:*?"<>]/g, ' ')
+        .replace(' ', '')
+        .toLowerCase()
 }
